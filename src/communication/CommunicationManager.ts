@@ -1,12 +1,16 @@
 import { TextChatManager, ChatMessage, ChatChannel, TextChatOptions } from './TextChatManager';
 import { VoiceChatManager, VoiceChannel, VoiceChatOptions, WebRTCSignalingData } from './VoiceChatManager';
+import { PositionalAudioManager, PositionalAudioOptions, AudioSource } from './PositionalAudioManager';
 import { Player } from '../types';
+import * as THREE from 'three';
 
 export interface CommunicationManagerOptions {
     textChat?: TextChatOptions;
     voiceChat?: VoiceChatOptions;
+    positionalAudio?: PositionalAudioOptions;
     enableTextChat?: boolean;
     enableVoiceChat?: boolean;
+    enablePositionalAudio?: boolean;
     enableCrossChannelModeration?: boolean;
     enableActivityLogging?: boolean;
     enableWebRTCSignaling?: boolean;
@@ -40,6 +44,7 @@ export interface PlayerCommunicationState {
 export class CommunicationManager {
     private textChatManager: TextChatManager;
     private voiceChatManager: VoiceChatManager;
+    private positionalAudioManager: PositionalAudioManager | null = null;
     private options: Required<CommunicationManagerOptions>;
     private playerStates: Map<string, PlayerCommunicationState> = new Map();
     private eventHistory: CommunicationEvent[] = [];
@@ -51,8 +56,10 @@ export class CommunicationManager {
         this.options = {
             textChat: options.textChat || {},
             voiceChat: options.voiceChat || {},
+            positionalAudio: options.positionalAudio || {},
             enableTextChat: options.enableTextChat !== false,
             enableVoiceChat: options.enableVoiceChat !== false,
+            enablePositionalAudio: options.enablePositionalAudio !== false,
             enableCrossChannelModeration: options.enableCrossChannelModeration !== false,
             enableActivityLogging: options.enableActivityLogging !== false,
             enableWebRTCSignaling: options.enableWebRTCSignaling !== false
@@ -61,6 +68,10 @@ export class CommunicationManager {
         // Initialize managers
         this.textChatManager = new TextChatManager(this.options.textChat);
         this.voiceChatManager = new VoiceChatManager(this.options.voiceChat);
+        
+        if (this.options.enablePositionalAudio) {
+            this.positionalAudioManager = new PositionalAudioManager(this.options.positionalAudio);
+        }
 
         this.setupEventHandlers();
         this.setupWebRTCSignaling();
@@ -108,7 +119,13 @@ export class CommunicationManager {
             let success = true;
 
             if (this.options.enableVoiceChat) {
-                success = await this.voiceChatManager.initialize();
+                const voiceResult = await this.voiceChatManager.initialize();
+                success = success && voiceResult.success;
+            }
+
+            if (this.options.enablePositionalAudio && this.positionalAudioManager) {
+                const audioResult = await this.positionalAudioManager.initialize();
+                success = success && audioResult.success;
             }
 
             this.isInitialized = success;
@@ -162,8 +179,7 @@ export class CommunicationManager {
         }
 
         for (const channelId of state.voiceChannels) {
-            this.voiceChatManager.leaveVoiceChannel(channelId, playerId);
-            this.voiceChatManager.disconnectFromPlayer(playerId);
+            this.voiceChatManager.leaveVoiceChannel(channelId, playerId, state.playerName);
         }
 
         this.playerStates.delete(playerId);
@@ -277,7 +293,8 @@ export class CommunicationManager {
     // Voice chat methods
     async enableMicrophone(): Promise<boolean> {
         if (!this.options.enableVoiceChat) return false;
-        return this.voiceChatManager.enableMicrophone();
+        const result = await this.voiceChatManager.enableMicrophone();
+        return result.success;
     }
 
     disableMicrophone(): void {
@@ -286,26 +303,15 @@ export class CommunicationManager {
         }
     }
 
-    async connectToPlayerVoice(
-        playerId: string,
-        channelId: string,
-        isInitiator: boolean = false
-    ): Promise<boolean> {
+    joinVoiceChannel(playerId: string, channelId: string): boolean {
         if (!this.options.enableVoiceChat) return false;
 
         const state = this.playerStates.get(playerId);
         if (!state) return false;
 
-        return this.voiceChatManager.connectToPlayer(playerId, state.playerName, channelId, isInitiator);
-    }
-
-    joinVoiceChannel(playerId: string, channelId: string): boolean {
-        if (!this.options.enableVoiceChat) return false;
-
-        const success = this.voiceChatManager.joinVoiceChannel(channelId, playerId);
+        const success = this.voiceChatManager.joinVoiceChannel(channelId, playerId, state.playerName);
         if (success) {
-            const state = this.playerStates.get(playerId);
-            if (state && !state.voiceChannels.includes(channelId)) {
+            if (!state.voiceChannels.includes(channelId)) {
                 state.voiceChannels.push(channelId);
             }
         }
@@ -316,7 +322,10 @@ export class CommunicationManager {
     leaveVoiceChannel(playerId: string, channelId: string): boolean {
         if (!this.options.enableVoiceChat) return false;
 
-        const success = this.voiceChatManager.leaveVoiceChannel(channelId, playerId);
+        const state = this.playerStates.get(playerId);
+        if (!state) return false;
+
+        const success = this.voiceChatManager.leaveVoiceChannel(channelId, playerId, state.playerName);
         if (success) {
             this.removePlayerFromVoiceChannel(playerId, channelId);
         }
@@ -324,23 +333,61 @@ export class CommunicationManager {
         return success;
     }
 
-    // WebRTC signaling methods
-    async handleVoiceOffer(playerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
-        if (this.options.enableVoiceChat) {
-            await this.voiceChatManager.handleOffer(playerId, offer);
+    // Positional Audio methods
+    addAudioSource(playerId: string, audioElement: HTMLAudioElement, position: THREE.Vector3): AudioSource | null {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return null;
+
+        const state = this.playerStates.get(playerId);
+        if (!state) return null;
+
+        return this.positionalAudioManager.addAudioSource(playerId, state.playerName, audioElement, position);
+    }
+
+    removeAudioSource(sourceId: string): boolean {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return false;
+        return this.positionalAudioManager.removeAudioSource(sourceId);
+    }
+
+    updatePlayerAudioPosition(playerId: string, position: THREE.Vector3, velocity?: THREE.Vector3): void {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return;
+
+        const sources = this.positionalAudioManager.getAudioSourcesByPlayer(playerId);
+        for (const source of sources) {
+            this.positionalAudioManager.updateSourcePosition(source.id, position, velocity);
         }
     }
 
-    async handleVoiceAnswer(playerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
-        if (this.options.enableVoiceChat) {
-            await this.voiceChatManager.handleAnswer(playerId, answer);
-        }
+    setAudioListener(playerId: string, position: THREE.Vector3, orientation: THREE.Vector3): void {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return;
+        this.positionalAudioManager.setAudioListener(playerId, position, orientation);
     }
 
-    async handleIceCandidate(playerId: string, candidate: RTCIceCandidateInit): Promise<void> {
-        if (this.options.enableVoiceChat) {
-            await this.voiceChatManager.handleIceCandidate(playerId, candidate);
+    updateAudioListener(position: THREE.Vector3, orientation: THREE.Vector3, velocity?: THREE.Vector3): void {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return;
+        this.positionalAudioManager.updateListenerPosition(position, orientation, velocity);
+    }
+
+    getPlayersInVoiceRange(listenerPosition: THREE.Vector3): string[] {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return [];
+        return this.positionalAudioManager.getPlayersInVoiceRange(listenerPosition);
+    }
+
+    setMasterAudioVolume(volume: number): void {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return;
+        this.positionalAudioManager.setMasterVolume(volume);
+    }
+
+    setPlayerAudioVolume(playerId: string, volume: number): boolean {
+        if (!this.options.enablePositionalAudio || !this.positionalAudioManager) return false;
+
+        const sources = this.positionalAudioManager.getAudioSourcesByPlayer(playerId);
+        let success = false;
+        for (const source of sources) {
+            if (this.positionalAudioManager.setSourceVolume(source.id, volume)) {
+                success = true;
+            }
         }
+        return success;
     }
 
     // Moderation
@@ -362,7 +409,10 @@ export class CommunicationManager {
 
     mutePlayerVoice(playerId: string): void {
         if (this.options.enableVoiceChat) {
-            this.voiceChatManager.mutePlayer(playerId);
+            // Set volume to 0 for positional audio
+            if (this.options.enablePositionalAudio) {
+                this.setPlayerAudioVolume(playerId, 0);
+            }
             this.updatePlayerState(playerId, { isVoiceMuted: true });
             this.logEvent('moderation', 'system', 'voice-global', { action: 'voice_mute', playerId });
         }
@@ -370,7 +420,10 @@ export class CommunicationManager {
 
     unmutePlayerVoice(playerId: string): void {
         if (this.options.enableVoiceChat) {
-            this.voiceChatManager.unmutePlayer(playerId);
+            // Restore volume for positional audio
+            if (this.options.enablePositionalAudio) {
+                this.setPlayerAudioVolume(playerId, 1);
+            }
             this.updatePlayerState(playerId, { isVoiceMuted: false });
             this.logEvent('moderation', 'system', 'voice-global', { action: 'voice_unmute', playerId });
         }
@@ -431,15 +484,16 @@ export class CommunicationManager {
     }
 
     getVoiceChannels(): VoiceChannel[] {
-        return this.options.enableVoiceChat ? this.voiceChatManager.getVoiceChannels() : [];
+        return this.options.enableVoiceChat ? [this.voiceChatManager.getVoiceChannel('voice-global')].filter(Boolean) : [];
     }
 
     getMessageHistory(channelId: string, limit?: number): ChatMessage[] {
         return this.options.enableTextChat ? this.textChatManager.getMessageHistory(channelId, limit) : [];
     }
 
-    getVoiceConnections(): VoiceConnection[] {
-        return this.options.enableVoiceChat ? this.voiceChatManager.getActiveConnections() : [];
+    getAudioSources(): AudioSource[] {
+        return this.options.enablePositionalAudio && this.positionalAudioManager ? 
+            this.positionalAudioManager.getAllAudioSources() : [];
     }
 
     getEventHistory(timeWindow?: number): CommunicationEvent[] {
@@ -481,9 +535,12 @@ export class CommunicationManager {
             totalMessages: 0
         };
 
-        const voiceStats = this.options.enableVoiceChat ? this.voiceChatManager.getStatistics() : {
-            totalChannels: 0,
-            activeConnections: 0
+        const voiceChannels = this.getVoiceChannels();
+        const audioSources = this.getAudioSources();
+
+        const voiceStats = {
+            totalChannels: voiceChannels.length,
+            activeConnections: audioSources.filter(source => source.isActive).length
         };
 
         return {
@@ -540,6 +597,12 @@ export class CommunicationManager {
         }
     }
 
+    updatePositionalAudioOptions(options: Partial<PositionalAudioOptions>): void {
+        if (this.options.enablePositionalAudio && this.positionalAudioManager) {
+            this.positionalAudioManager.updateOptions(options);
+        }
+    }
+
     // WebRTC Signaling
     private setupWebRTCSignaling(): void {
         if (!this.options.enableWebRTCSignaling) return;
@@ -572,7 +635,8 @@ export class CommunicationManager {
 
     handleIncomingSignaling(data: WebRTCSignalingData): void {
         if (this.options.enableVoiceChat && this.options.enableWebRTCSignaling) {
-            this.voiceChatManager.handleSignalingMessage(data);
+            // Handle signaling through voice chat manager
+            this.emitEvent('webrtc_signaling_received', data);
         }
     }
 
@@ -586,6 +650,11 @@ export class CommunicationManager {
         // Dispose managers
         this.textChatManager.dispose();
         this.voiceChatManager.dispose();
+        
+        if (this.positionalAudioManager) {
+            this.positionalAudioManager.dispose();
+            this.positionalAudioManager = null;
+        }
 
         // Clear data
         this.playerStates.clear();
